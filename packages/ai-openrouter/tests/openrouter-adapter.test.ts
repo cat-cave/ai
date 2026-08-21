@@ -1272,6 +1272,114 @@ describe('OpenRouter structured output', () => {
     expect(params.stream).toBe(false)
   })
 
+  it('forwards response.usage tokens and cost on structuredOutput (#1076)', async () => {
+    // Regression: structuredOutput used to return only { data, rawText },
+    // dropping OpenRouter usage/cost so middleware onFinish/onUsage saw
+    // nothing after non-stream structured calls.
+    const nonStreamResponse = {
+      choices: [
+        {
+          message: {
+            content: '{"title":"Hello"}',
+          },
+        },
+      ],
+      usage: {
+        promptTokens: 12,
+        completionTokens: 4,
+        totalTokens: 16,
+        cost: 0.00042,
+        costDetails: { upstreamInferenceCost: 0.0003 },
+      },
+    }
+
+    setupMockSdkClient([], nonStreamResponse)
+    const adapter = createAdapter()
+
+    const result = await adapter.structuredOutput({
+      chatOptions: {
+        model: 'openai/gpt-4o-mini',
+        messages: [{ role: 'user', content: 'Return a short title as JSON.' }],
+        logger: testLogger,
+      },
+      outputSchema: {
+        type: 'object',
+        properties: { title: { type: 'string' } },
+        required: ['title'],
+      },
+    })
+
+    expect(result.data).toEqual({ title: 'Hello' })
+    expect(result.usage).toEqual({
+      promptTokens: 12,
+      completionTokens: 4,
+      totalTokens: 16,
+      cost: 0.00042,
+      costDetails: { upstreamCost: 0.0003 },
+    })
+  })
+
+  it('omits usage when the provider reports none on structuredOutput', async () => {
+    setupMockSdkClient([], {
+      choices: [{ message: { content: '{"title":"x"}' } }],
+    })
+    const adapter = createAdapter()
+
+    const result = await adapter.structuredOutput({
+      chatOptions: {
+        model: 'openai/gpt-4o-mini',
+        messages: [{ role: 'user', content: 'title' }],
+        logger: testLogger,
+      },
+      outputSchema: {
+        type: 'object',
+        properties: { title: { type: 'string' } },
+        required: ['title'],
+      },
+    })
+
+    expect(result.usage).toBeUndefined()
+  })
+
+  it('honors json_object for non-streaming structured output', async () => {
+    setupMockSdkClient([], {
+      choices: [
+        {
+          message: {
+            content: '{"name":"Alice","age":30}',
+          },
+        },
+      ],
+    })
+    const adapter = createAdapter()
+
+    const result = await adapter.structuredOutput({
+      chatOptions: {
+        model: 'openai/gpt-4o-mini',
+        messages: [{ role: 'user', content: 'Give me a person as json' }],
+        logger: testLogger,
+        modelOptions: {
+          responseFormat: { type: 'json_object' },
+        },
+      },
+      outputSchema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string' },
+          age: { type: 'number' },
+        },
+        required: ['name', 'age'],
+      },
+    })
+
+    expect(result.data).toEqual({ name: 'Alice', age: 30 })
+    const [rawParams] = mockSend.mock.calls[0]!
+    expect(rawParams.chatRequest.responseFormat).toEqual({
+      type: 'json_object',
+    })
+    expect(rawParams.chatRequest.stream).toBe(false)
+  })
+
   it('makes schema OpenAI-strict compatible before sending', async () => {
     // Regression: upstream providers (OpenAI) reject json_schema requests with
     // strict: true unless every object sets additionalProperties: false and
@@ -1436,8 +1544,60 @@ describe('OpenRouter structured output', () => {
     expect(sentSchema.properties.nickname.type).toEqual(['string', 'null'])
   })
 
+  it('honors json_object through core chat() structured streaming', async () => {
+    setupMockSdkClient([
+      {
+        id: 'c-json-object',
+        model: 'openai/gpt-4o-mini',
+        choices: [
+          {
+            delta: { content: '{"name":"Alice","age":30}' },
+            finishReason: 'stop',
+          },
+        ],
+      },
+    ])
+    const adapter = createAdapter()
+
+    const result = await chat({
+      adapter,
+      messages: [{ role: 'user', content: 'Give me a person as json' }],
+      modelOptions: {
+        responseFormat: { type: 'json_object' },
+      },
+      outputSchema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string' },
+          age: { type: 'number' },
+        },
+        required: ['name', 'age'],
+      },
+    })
+
+    expect(result).toEqual({ name: 'Alice', age: 30 })
+    const [rawParams] = mockSend.mock.calls[0]!
+    expect(rawParams.chatRequest.responseFormat).toEqual({
+      type: 'json_object',
+    })
+    expect(rawParams.chatRequest.stream).toBe(true)
+  })
+
   it('parses JSON response content correctly', async () => {
     const nonStreamResponse = {
+      id: 'gen-structured-chat',
+      openrouterMetadata: {
+        endpoints: {
+          available: [
+            {
+              model: 'openai/gpt-4o-mini',
+              provider: 'DeepInfra',
+              selected: true,
+            },
+          ],
+          total: 1,
+        },
+      },
       choices: [
         {
           message: {
@@ -1460,6 +1620,8 @@ describe('OpenRouter structured output', () => {
     })
 
     expect(result.data).toEqual({ items: [1, 2, 3], total: 3 })
+    expect(result.generationId).toBe('gen-structured-chat')
+    expect(result.provider).toBe('DeepInfra')
   })
 
   it('throws on malformed JSON response', async () => {
@@ -2585,27 +2747,34 @@ describe('OpenRouter cost tracking', () => {
   // defers RUN_FINISHED until the stream drains so this chunk is captured.
   const baseStream = (
     usage: Record<string, unknown>,
+    metadata: Record<string, unknown> = {},
   ): Array<Record<string, unknown>> => [
     {
       id: 'chatcmpl-cost',
       model: 'openai/gpt-4o-mini',
       choices: [{ delta: { content: 'Hi' }, finishReason: null }],
+      ...metadata,
     },
     {
       id: 'chatcmpl-cost',
       model: 'openai/gpt-4o-mini',
       choices: [{ delta: {}, finishReason: 'stop' }],
+      ...metadata,
     },
     {
       id: 'chatcmpl-cost',
       model: 'openai/gpt-4o-mini',
       choices: [],
       usage,
+      ...metadata,
     },
   ]
 
-  const runFinished = async (usage: Record<string, unknown>) => {
-    setupMockSdkClient(baseStream(usage))
+  const runFinished = async (
+    usage: Record<string, unknown>,
+    metadata?: Record<string, unknown>,
+  ) => {
+    setupMockSdkClient(baseStream(usage, metadata))
     const chunks: Array<StreamChunk> = []
     for await (const chunk of chat({
       adapter: createAdapter(),
@@ -2643,6 +2812,33 @@ describe('OpenRouter cost tracking', () => {
           upstreamOutputCost: 0.0026,
         },
       },
+    })
+  })
+
+  it('forwards generation id and selected provider', async () => {
+    const runFinishedChunk = await runFinished(
+      { promptTokens: 5, completionTokens: 2, totalTokens: 7 },
+      {
+        id: 'gen-chat-stream',
+        openrouterMetadata: {
+          endpoints: {
+            available: [
+              {
+                model: 'openai/gpt-4o-mini',
+                provider: 'DeepInfra',
+                selected: true,
+              },
+            ],
+            total: 1,
+          },
+        },
+      },
+    )
+
+    expect(runFinishedChunk).toMatchObject({
+      type: 'RUN_FINISHED',
+      generationId: 'gen-chat-stream',
+      provider: 'DeepInfra',
     })
   })
 

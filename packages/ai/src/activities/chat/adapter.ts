@@ -44,6 +44,10 @@ export interface StructuredOutputResult<T = unknown> {
   rawText: string
   /** Token usage information (if provided by the adapter) */
   usage?: TokenUsage
+  /** Provider generation identifier, when reported by the adapter. */
+  generationId?: string
+  /** Provider that served the generation, when reported by the adapter. */
+  provider?: string
 }
 
 /**
@@ -131,7 +135,8 @@ export interface TextAdapter<
    * Implementations must emit standard AG-UI lifecycle events (RUN_STARTED,
    * TEXT_MESSAGE_*, RUN_FINISHED) carrying raw JSON text deltas, plus a final
    * `CUSTOM` event named `structured-output.complete` whose `value` is
-   * `{ object, raw, reasoning? }`.
+   * `{ object, raw, reasoning? }`. Events must be timestamped when emitted so
+   * their timestamps follow stream order.
    */
   structuredOutputStream?: (
     options: StructuredOutputOptions<TProviderOptions>,
@@ -159,6 +164,20 @@ export interface TextAdapter<
   supportsCombinedToolsAndSchema?: (
     modelOptions?: TProviderOptions | undefined,
   ) => boolean
+
+  /**
+   * Where native-combined structured output is taken from.
+   *
+   * - `'text'` (default when omitted): the agent loop's accumulated
+   *   assistant text is schema JSON. The engine parses it after the loop.
+   *   HTTP adapters use this.
+   * - `'event'`: the adapter emits `structured-output.complete` during
+   *   `chatStream`. The engine must not parse accumulated prose. Harness
+   *   adapters use this.
+   */
+  combinedStructuredOutputSource?: (
+    modelOptions?: TProviderOptions | undefined,
+  ) => 'text' | 'event'
 }
 
 /**
